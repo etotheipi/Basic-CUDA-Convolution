@@ -26,6 +26,13 @@
 
 using namespace std;
 
+////////////////////////////////////////////////////////////////////////////////
+// Copy a 3D texture from a host (float*) array to a device cudaArray
+// The extent should be specified with all dimensions in units of *elements*
+void prepareCudaTexture(float* h_src, 
+                        cudaArray *d_dst,
+                        cudaExtent const texExtent);
+
 
 // Assume target memory has already been allocated, nPixels is odd
 void createGaussian1D(float* targPtr, 
@@ -44,11 +51,25 @@ void createGaussian2D(float* targPtr,
 
 // Assume diameter^2 target memory has already been allocated
 void createBinaryCircle(float* targPtr,
+                        int&   seNonZero,
                         int    diameter); 
 
 // Assume diameter^2 target memory has already been allocated
 void createBinaryCircle(int* targPtr,
+                        int& seNonZero,
                         int  diameter); 
+
+// Assume diameter^2 target memory has already been allocated
+// This filter is used for edge detection.  Convolve with the
+// kernel created by this function, and then look for the 
+// zero-crossings
+// As always, we expect an odd diameter
+// For LoG kernels, we always assume square and symmetric,
+// which is why there are no options for different dimensions
+void createLaplacianOfGaussianKernel(float* targPtr,
+                                     int    diameter);
+
+
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -109,8 +130,8 @@ int main( int argc, char** argv)
    // the COPY_LIN_ARRAY_TO_SHMEM macro looping
    unsigned int imgW  = 512;
    unsigned int imgH  = 512;
-   unsigned int psfW  = 17;
-   unsigned int psfH  = 17;
+   unsigned int psfW  = 3;
+   unsigned int psfH  = 3;
    unsigned int nPix  = imgH*imgW;
    unsigned int nPsf  = psfW*psfH;
    // I would've expected 32x8 to reduce bank conflicts, but 8x32 is 
@@ -149,19 +170,22 @@ int main( int argc, char** argv)
    // col-major, so we reverse the order of loops
 
    //createGaussian2D(imgPsf, psfW, psfH, (float)psfW/5.5, (float)psfH/5.5);
-   //createBinaryCircle(imgPsf, psfW);
+   int seNonZero;
+   createBinaryCircle(imgPsf, seNonZero, psfW);
+   cout << " SE Non Zero Elements: " << seNonZero << endl;
+   //createLaplacianOfGaussianKernel(imgPsf, psfW);
    //ifstream fpPsf("se_3x3_asymm.txt", ios::in);
    //ifstream fpPsf("asymmPSF_15x15.txt", ios::in);
-   ifstream fpPsf("asymmPSF_17x17.txt", ios::in);
+   //ifstream fpPsf("asymmPSF_17x17.txt", ios::in);
    //ifstream fpPsf("asymmPSF_25x25.txt", ios::in);
    //cout << endl << "Point Spread Function: " << endl;
-   for(int r=0; r<psfH; r++)
-   {
-      for(int c=0; c<psfW; c++)
-      {
-         fpPsf >> imgPsf[c*psfH+r];
-      }
-   }
+   //for(int r=0; r<psfH; r++)
+   //{
+      //for(int c=0; c<psfW; c++)
+      //{
+         //fpPsf >> imgPsf[c*psfH+r];
+      //}
+   //}
 
    // Write out the PSF so can be checked later
    ofstream psfout("psf.txt", ios::out);
@@ -200,13 +224,33 @@ int main( int argc, char** argv)
    cudaMemcpy(devIn,  imgIn,   imgBytes, cudaMemcpyHostToDevice);
    cudaMemcpy(devPsf, imgPsf,  psfBytes, cudaMemcpyHostToDevice);
 
+   // TODO:  Probably remove this, it works but not needed for this application
+   /////////////////////////////////////////////////////////////////////////////
+   // Load the PSF into texture memory
+   /////////////////////////////////////////////////////////////////////////////
+   //cudaArray* caPsf;
+   //cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
+   //cudaExtent texExtent = make_cudaExtent(psfH, psfW, 1);
+   //cutilSafeCall( cudaMalloc3DArray(&caPsf, &channelDesc, texExtent, 0) );
+   //prepareCudaTexture(imgPsf, caPsf, texExtent);
+   /////////////////////////////////////////////////////////////////////////////
+   // Now we bind the texture to the reference /////////////////////////////////
+   //cudaGetTextureReference(&texPsfRef,"texPsf");
+   //texPsf.addressMode[0] = cudaAddressModeClamp;
+   //texPsf.addressMode[1] = cudaAddressModeClamp;
+   //texPsf.addressMode[2] = cudaAddressModeClamp;
+   //texPsf.filterMode     = cudaFilterModeLinear;
+   //texPsf.normalized     = false;
+   //cudaBindTextureToArray(texPsfRef, caPsf, &channelDesc);
+
+
 
    // Set up kernel execution geometry
    // **************************************************************************
    // The data is on the HOST, do a full round-trip calculation w/ mem copies
    cout << "Data loaded into HOST mem, executing kernel..." << endl;
-   convolveBasic<<<GRID, BLOCK>>>(devIn, devOut, devPsf, 
-                                                imgW, imgH, psfW/2, psfH/2);
+   kernelDilate<<<GRID, BLOCK>>>(devIn, devOut, devPsf, 
+                                  imgW, imgH, psfW/2, psfH/2, seNonZero);
    cutilCheckMsg("Kernel execution failed");  // Check if kernel exec failed
    cudaThreadSynchronize();
 
@@ -227,8 +271,8 @@ int main( int argc, char** argv)
    cutilCheckError( cutStartTimer( timer));
    for(int i=0; i<NITER; i++)
    {
-      convolveBasic<<<GRID, BLOCK>>>(devIn, devOut, devPsf, 
-                                                   imgW, imgH, psfW/2, psfH/2);
+      kernelDilate<<<GRID, BLOCK>>>(devIn, devOut, devPsf, 
+                                  imgW, imgH, psfW/2, psfH/2, seNonZero);
       cutilCheckMsg("Kernel execution failed");  // Check if kernel exec failed
       cudaThreadSynchronize();
    }
@@ -240,9 +284,9 @@ int main( int argc, char** argv)
    float memCopyTime = gpuTime_w_copy - gpuTime_compute_only;
    float cpySpeed = 2.0 * (float)imgBytes / (float)(memCopyTime/1000. * 1024 * 1024);
    cout << "Final Timing Results:" << endl << endl;
-   printf("\tMemory copies            :  %.3f ms (%0.1f MB/s)\n", memCopyTime, cpySpeed);
+   printf("\tMemory copies (Host-Dev) :  %.3f ms (%0.1f MB/s)\n", memCopyTime, cpySpeed);
    printf("\tRaw computation time     :  %.3f ms\n", gpuTime_compute_only);
-   printf("\t-----------------------------------\n");
+   printf("\t-----------------------------------------------------\n");
    printf("\tTotal time w/ mem copies :  %.3f ms\n\n", gpuTime_w_copy);
 
 
@@ -443,25 +487,33 @@ void createGaussian2D(float* targPtr,
 
 // Assume diameter^2 target memory has already been allocated
 void createBinaryCircle(float* targPtr,
-                        int  diameter)
+                        int&   seNonZero,
+                        int    diameter)
 {
    float pxCtr = (float)(diameter-1) / 2.0f;
    float rad;
+   seNonZero = 0;
    for(int c=0; c<diameter; c++)
    {
       for(int r=0; r<diameter; r++)
       {
          rad = sqrt((c-pxCtr)*(c-pxCtr) + (r-pxCtr)*(r-pxCtr));
          if(rad <= pxCtr+0.5)
+         {
             targPtr[c*diameter+r] = 1.0f;
+            seNonZero++;
+         }
          else
+         {
             targPtr[c*diameter+r] = 0.0f;
+         }
       }
    }
 }
 
 // Assume diameter^2 target memory has already been allocated
-void createBinaryCircle(int* targPtr,
+void createBinaryCircle(int*   targPtr,
+                        int&   seNonZero,
                         int    diameter)
 {
    float pxCtr = (float)(diameter-1) / 2.0f;
@@ -477,4 +529,50 @@ void createBinaryCircle(int* targPtr,
             targPtr[c*diameter+r] = 0;
       }
    }
+}
+
+// Assume diameter^2 target memory has already been allocated
+// This filter is used for edge detection.  Convolve with the
+// kernel created by this function, and then look for the 
+// zero-crossings
+// As always, we expect an odd diameter
+// For LoG kernels, we always assume square and symmetric,
+// which is why there are no options for different dimensions
+void createLaplacianOfGaussianKernel(float* targPtr,
+                                     int    diameter)
+{
+   float pxCtr = (float)(diameter-1) / 2.0f;
+   float dc, dr, dcSq, drSq;
+   float sigma = diameter/10.0f;
+   float sigmaSq = sigma*sigma;
+   for(int c=0; c<diameter; c++)
+   {
+      dc = (float)c - pxCtr;
+      dcSq = dc*dc;
+      for(int r=0; r<diameter; r++)
+      {
+         dr = (float)r - pxCtr;
+         drSq = dr*dr;
+   
+         float firstTerm  = (dcSq + drSq - 2*sigmaSq) / (sigmaSq * sigmaSq);
+         float secondTerm = exp(-0.5 * (dcSq + drSq) / sigmaSq);
+         targPtr[c*diameter+r] = firstTerm * secondTerm;
+      }
+   }
+}
+
+void prepareCudaTexture(float* h_src, 
+                        cudaArray *d_dst,
+                        cudaExtent const texExtent)
+{
+   cudaMemcpy3DParms copyParams = {0};
+   cudaPitchedPtr cppImgPsf = make_cudaPitchedPtr( (void*)h_src, 
+                                                   texExtent.width*FLOAT_SZ,
+                                                   texExtent.width,  
+                                                   texExtent.height);
+   copyParams.srcPtr   = cppImgPsf;
+   copyParams.dstArray = d_dst;
+   copyParams.extent   = texExtent;
+   copyParams.kind     = cudaMemcpyHostToDevice;
+   cutilSafeCall( cudaMemcpy3D(&copyParams) );
 }

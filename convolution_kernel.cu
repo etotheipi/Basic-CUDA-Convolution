@@ -13,8 +13,9 @@ using namespace std;
 #define SHMEM 8192
 #define FLOAT_SZ sizeof(float)
 
-//texture<float, 3, cudaReadModeElementType> texRef;
-//textureReference* texPsfPtr;
+texture<float, 3, cudaReadModeElementType> texPsf;
+textureReference* texPsfRef;
+// Use tex3D(texPsf, x, y, z) to access texture data
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -40,7 +41,7 @@ using namespace std;
    const int padRectStride = blockDim.y + 2*psfRowRad;   \
    const int padRectCol    = localCol + psfColRad;   \
    const int padRectRow    = localRow + psfRowRad;   \
-   const int padRectIdx    = IDX_1D(padRectCol, padRectRow, padRectStride); \
+   /*const int padRectIdx    = IDX_1D(padRectCol, padRectRow, padRectStride); */ \
    const int padRectPixels = padRectStride * (blockDim.x + 2*psfColRad);   \
 \
    __shared__ char sharedMem[SHMEM];   \
@@ -250,11 +251,11 @@ __global__ void   convolveBilateral(
 
 ////////////////////////////////////////////////////////////////////////////////
 //
-// For binary morphology, we use {-1, 0, +1} for two reasons:
+// For binary morphology (erode/dilate), we use {-1, 0, +1} for two reasons:
 //
 //    1)  {-1, 0, +1} ~ {OFF, DONTCARE, ON} for more advanced morph operations
 //    2)  Computationally, we can multiply SE components to img components and 
-//        get faster results than using lots of if-statements
+//        get faster results than using if-statements in the inner loop
 //
 ////////////////////////////////////////////////////////////////////////////////
 __global__ void  kernelDilate( 
@@ -264,7 +265,8 @@ __global__ void  kernelDilate(
                int    imgCols,    
                int    imgRows,    
                int    psfColRad,
-               int    psfRowRad)
+               int    psfRowRad,
+               int    seNonZero)
 {  
 
    CREATE_CONVOLUTION_VARIABLES(psfColRad, psfRowRad); 
@@ -281,7 +283,7 @@ __global__ void  kernelDilate(
 
    __syncthreads();   
 
-   bool accumBool = false;
+   float accumFloat = 0.0f;
    for(int coff=-psfColRad; coff<=psfColRad; coff++)   
    {   
       for(int roff=-psfRowRad; roff<=psfRowRad; roff++)   
@@ -294,11 +296,12 @@ __global__ void  kernelDilate(
          int shmPRCol = padRectCol + coff;   
          int shmPRRow = padRectRow + roff;   
          int shmPRIdx = IDX_1D(shmPRCol, shmPRRow, padRectStride);   
-         if(psfVal * shmPadRect[shmPRIdx] > 0.5)
-            accumBool = true;
+         accumFloat += psfVal * shmPadRect[shmPRIdx];
       }   
    }   
-   if(accumBool)
+   // If not a single on pixel overlapped with the SE, accumFloat==-seNonZero
+   // Since we're using floats, don't use == operator
+   if(-accumFloat < seNonZero-0.5)
       shmOutput[localIdx] = 1.0f; 
 
    __syncthreads();   
@@ -312,7 +315,7 @@ __global__ void  kernelDilate(
 //
 //    1)  {-1, 0, +1} ~ {OFF, DONTCARE, ON} for more advanced morph operations
 //    2)  Computationally, we can multiply SE components to img components and 
-//        get faster results than using lots of if-statements
+//        get faster results than using if-statements in the inner loop
 //
 ////////////////////////////////////////////////////////////////////////////////
 __global__ void  kernelErode( 
@@ -322,7 +325,8 @@ __global__ void  kernelErode(
                int    imgCols,    
                int    imgRows,    
                int    psfColRad,
-               int    psfRowRad)
+               int    psfRowRad,
+               int    seNonZero)
 {  
 
    CREATE_CONVOLUTION_VARIABLES(psfColRad, psfRowRad); 
@@ -339,7 +343,7 @@ __global__ void  kernelErode(
 
    __syncthreads();   
 
-   bool accumBool = true;
+   float accumFloat = 0.0f;
    for(int coff=-psfColRad; coff<=psfColRad; coff++)   
    {   
       for(int roff=-psfRowRad; roff<=psfRowRad; roff++)   
@@ -352,12 +356,14 @@ __global__ void  kernelErode(
          int shmPRCol = padRectCol + coff;   
          int shmPRRow = padRectRow + roff;   
          int shmPRIdx = IDX_1D(shmPRCol, shmPRRow, padRectStride);   
-         if(psfVal * shmPadRect[shmPRIdx] < -0.5)
-            accumBool = false;
+         accumFloat += psfVal * shmPadRect[shmPRIdx];
       }   
    }   
-   if(accumBool)
+   // If every pixel was identical as expected, accumFloat==seNonZero
+   // Since we're using floats, don't use == operator
+   if(accumFloat > seNonZero-0.5)
       shmOutput[localIdx] = 1.0f; 
+
    __syncthreads();   
 
    imgOutPtr[globalIdx] = (shmOutput[localIdx]+1)/2.0f;
